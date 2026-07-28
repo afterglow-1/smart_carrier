@@ -393,6 +393,23 @@ void startSensorlessHome(uint8_t id) {
   armProtocol.Emm_V5_Origin_Trigger_Return(
       id, SENSORLESS_HOME_MODE, false);
 
+  // The driver immediately acknowledges 0x9A.  Do not start monitoring a
+  // homing operation that the driver has rejected (for example, with 0xE2).
+  uint8_t response[4] = {};
+  if (!readFrame(id, 0x9A, sizeof(response), response, QUERY_TIMEOUT_MS)) {
+    SerialDebug.print(F("HOME_TRIGGER_TIMEOUT,id="));
+    SerialDebug.println(id);
+    return;
+  }
+  if (response[2] != 0x02) {
+    SerialDebug.print(F("HOME_TRIGGER_REJECTED,id="));
+    SerialDebug.print(id);
+    SerialDebug.print(F(",status=0x"));
+    printHexByte(response[2]);
+    SerialDebug.println();
+    return;
+  }
+
   homeMonitor = HomeMonitor{};
   homeMonitor.active = true;
   homeMonitor.id = id;
