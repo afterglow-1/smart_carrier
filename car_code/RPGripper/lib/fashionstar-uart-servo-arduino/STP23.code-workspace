@@ -1,0 +1,20 @@
+{
+	"folders": [
+		{
+			"path": "C:/Users/zjusu/Documents/PlatformIO/Projects/STP23"
+		},
+		{
+			"name": "Marlin-2.1",
+			"path": "../../../../windows11software/Marlin-2.1/Marlin-2.1"
+		},
+		{
+			"name": "SunnybotARM",
+			"path": "../.."
+		},
+		{
+			"name": "ESPBOT_PIO",
+			"path": "C:/Users/zjusu/Documents/PlatformIO/Projects/ESPBOT_PIO"
+		}
+	],
+	"settings": {}
+}

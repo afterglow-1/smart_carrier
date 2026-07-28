@@ -1,0 +1,76 @@
+<!DOCTYPE HTML><html>
+  
+<head>
+  <title>Sunnybot 4+1DOF ARM</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" type="text/css" href="style.css">
+   </head>
+<body>
+  <div class="topnav">
+    <h1>Sunnybot 4+1DOF ARM </h1>
+  </div>
+  <div class="content">
+    <div class="cards">
+      <div class="card">
+        <p class="card-title">舵机原始角度</p>
+        <p class="card-title">Servo Raw Angles</p>
+        <p><span class="reading">（舵机0）θ1: <span id="theta1">0.0</span> °</span></p>
+        <p><span class="reading">（舵机1）θ2: <span id="theta2">0.0</span> °</span></p>
+        <p><span class="reading">（舵机2）θ3: <span id="theta3">0.0</span> °</span></p>
+        <p><span class="reading">（舵机3）θ4: <span id="theta4">0.0</span> °</span></p>
+        <p><span class="reading">（舵机4）θ5: <span id="theta5">0.0</span> °</span></p>
+      </div>
+      <div class="card">
+        <p class="card-title">舵机标定角度<button id="sendPosition" >Send</button></p>
+        <p class="card-title">-Negative 竖立 +Positive(°)</p>
+        <p> <button  onclick="getElementById('theta1min').innerHTML = getElementById('theta1').innerHTML">T</button> <span id="theta1min">0</span>
+          <button onclick="getElementById('theta1mid').innerHTML = getElementById('theta1').innerHTML">T</button> <span id="theta1mid">0</span>
+          <button onclick="getElementById('theta1max').innerHTML = getElementById('theta1').innerHTML">T</button> <span id="theta1max">0</span>
+        </p>
+        <p> <button  onclick="getElementById('theta2min').innerHTML = getElementById('theta2').innerHTML">T</button> <span id="theta2min">0</span>
+          <button  onclick="getElementById('theta2mid').innerHTML = getElementById('theta2').innerHTML">T</button> <span id="theta2mid">0</span> 
+          <button  onclick="getElementById('theta2max').innerHTML = getElementById('theta2').innerHTML">T</button> <span id="theta2max">0</span> 
+        </p>
+        <p> <button  onclick="getElementById('theta3min').innerHTML = getElementById('theta3').innerHTML">T</button> <span id="theta3min">0</span>
+          <button  onclick="getElementById('theta3mid').innerHTML = getElementById('theta3').innerHTML">T</button> <span id="theta3mid">0</span> 
+          <button  onclick="getElementById('theta3max').innerHTML = getElementById('theta3').innerHTML">T</button> <span id="theta3max">0</span> 
+        </p>
+        <p> <button  onclick="getElementById('theta4min').innerHTML = getElementById('theta4').innerHTML">T</button> <span id="theta4min">0</span>
+          <button  onclick="getElementById('theta4mid').innerHTML = getElementById('theta4').innerHTML">T</button> <span id="theta4mid">0</span> 
+          <button  onclick="getElementById('theta4max').innerHTML = getElementById('theta4').innerHTML">T</button> <span id="theta4max">0</span> 
+        </p>
+        <p> <button  onclick="getElementById('theta5min').innerHTML = getElementById('theta5').innerHTML">T</button> <span id="theta5min">0</span>
+          <button  onclick="getElementById('theta5mid').innerHTML = getElementById('theta5').innerHTML">T</button> <span id="theta5mid">0</span> 
+          <button  onclick="getElementById('theta5max').innerHTML = getElementById('theta5').innerHTML">T</button> <span id="theta5max">0</span> 
+        </p>
+
+      </div>
+
+      <div class="card">
+        <p class="card-title">关节空间角度</p>
+        <p class="card-title">Arm Joint Angles</p>
+        <p><span class="reading">（基关节）J1: <span id="joint1"></span> °</span></p>
+        <p><span class="reading">（肩关节）J2: <span id="joint2"></span> °</span></p>
+        <p><span class="reading">（肘关节）J3: <span id="joint3"></span> °</span></p>
+        <p><span class="reading">（腕关节）J4: <span id="joint4"></span> °</span></p>
+        <p><span class="reading">（爪关节）G1: <span id="gripper1"></span> °</span></p>
+
+      </div>
+      <div class="card">
+        <p class="card-title">笛卡尔空间位姿</p>
+        <p class="card-title">Cartesian Coordinates</p>
+        <p><span class="reading">（末端）X: <span id="posX"></span> mm</span></p>
+        <p><span class="reading">（末端）Y: <span id="posY"></span> mm</span></p>
+        <p><span class="reading">（末端）Z: <span id="posZ"></span> mm</span></p>
+        <p><span class="reading">（俯仰）φ: <span id="pitch"></span> °</span></p>
+        <button id="reset" onclick="resetPosition(this)">RESET POSITION</button>
+        <button id="resetX" onclick="resetPosition(this)">X</button>
+        <button id="resetY" onclick="resetPosition(this)">Y</button>
+        <button id="resetZ" onclick="resetPosition(this)">Z</button>
+      </div>
+    </div>
+  </div>
+<script src="script.js"></script>
+</body>
+</html>
