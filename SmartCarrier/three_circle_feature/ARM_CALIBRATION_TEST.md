@@ -107,6 +107,35 @@ MARK,123456,rough1_circle1,-4000,90.000,0,0.0000,0.0000,0x03,0,0.0000,0.0000,0x0
 
 请分别采集粗加工区第 1/2 次和暂存区第 1/2 次的安全位、托盘悬停位、夹取位、抬升位、三个圆位和放回位。每个姿态重复到达三次并各执行一次 `mark`，最后把完整串口日志发回即可。
 
+## 自动保存到笔记本
+
+可以使用随本目录提供的电脑端采集脚本。它会同时生成：
+
+- `calibration_logs/arm_calibration_时间.log`：包含全部接收数据和发送命令。
+- `calibration_logs/arm_calibration_时间.csv`：只包含 `MARK` 标定行，可直接用 Excel 打开。
+
+先烧录测试固件，再关闭 PlatformIO Monitor，确保串口没有被其他程序占用。在 PowerShell 中执行：
+
+```powershell
+cd C:\Users\20261\Documents\PlatformIO\Projects\STM43H7DEMO\SmartCarrier\three_circle_feature
+& "$env:USERPROFILE\.platformio\penv\Scripts\python.exe" tools\capture_arm_calibration.py --port COM10
+```
+
+脚本启动后，串口输出会显示在当前窗口。直接在该窗口输入固件命令即可，例如：
+
+```text
+params 6
+params 7
+home 7
+home 6
+csv
+mark rough1_safe
+```
+
+退出时按 `Ctrl+C`。程序会打印两个已保存文件的完整路径。将 `.log` 和 `.csv` 文件直接作为附件发回即可；`.log` 用于排查回零过程，`.csv` 用于整理机械臂姿态。脚本不会自动发送运动命令，也不会改变驱动器参数。
+
+如果只使用 PlatformIO Monitor，也可以手动复制窗口内容，但不能同时运行 PlatformIO Monitor 和上述脚本，因为同一个 COM 口不能被两个程序同时打开。
+
 ## 协议依据
 
 根据《Emm_V5.0 步进闭环驱动说明书 Rev1.3》：
