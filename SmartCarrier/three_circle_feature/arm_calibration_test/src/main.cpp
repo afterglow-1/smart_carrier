@@ -363,6 +363,27 @@ void stopAxis(uint8_t id) {
   SerialDebug.println(id);
 }
 
+void clearStallProtection(uint8_t id) {
+  if (homeMonitor.active) {
+    SerialDebug.println(F("ERROR,clearstall_rejected_while_homing"));
+    return;
+  }
+
+  drainArmRx();
+  armProtocol.Emm_V5_Reset_Clog_Pro(id);
+  uint8_t response[4] = {};
+  if (!readFrame(id, 0x0E, sizeof(response), response, QUERY_TIMEOUT_MS)) {
+    SerialDebug.print(F("CLEARSTALL_TIMEOUT,id="));
+    SerialDebug.println(id);
+    return;
+  }
+  SerialDebug.print(F("CLEARSTALL,id="));
+  SerialDebug.print(id);
+  SerialDebug.print(F(",status=0x"));
+  printHexByte(response[2]);
+  SerialDebug.println();
+}
+
 void emergencyStop() {
   m5.moveTo(m5.currentPosition());
   digitalWrite(M5_ENABLE_PIN, HIGH);
@@ -662,6 +683,7 @@ void printHelp() {
   SerialDebug.println(F("  home <6|7>               trigger mode-2 sensorless homing"));
   SerialDebug.println(F("  origin <6|7|all>         read homing flags"));
   SerialDebug.println(F("  abort <6|7>              interrupt homing and stop axis"));
+  SerialDebug.println(F("  clearstall <6|7>         clear driver stall protection"));
   SerialDebug.println(F("  enable <6|7> | disable <6|7>"));
   SerialDebug.println(F("  jog <6|7> <cw|ccw> <pulses> [rpm] [acc]"));
   SerialDebug.println(F("  pos <6|7|all> | state <6|7|all>"));
@@ -736,6 +758,15 @@ void processCommand(char *line) {
       return;
     }
     stopAxis(id);
+    return;
+  }
+  if (equalsIgnoreCase(command, "clearstall")) {
+    uint8_t id = 0;
+    if (!parseArmId(strtok(nullptr, " \t"), id)) {
+      SerialDebug.println(F("ERROR,clearstall_requires_6_or_7"));
+      return;
+    }
+    clearStallProtection(id);
     return;
   }
   if (equalsIgnoreCase(command, "enable") ||
