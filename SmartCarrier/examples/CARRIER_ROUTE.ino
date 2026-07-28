@@ -21,13 +21,14 @@ static_assert(CARRIER_START_ZONE == 1 || CARRIER_START_ZONE == 2,
  * 一、坐标与方向约定
  * ---------------------------------------------------------------
  * FORWARD/BACKWARD/LEFT/RIGHT均为“车体坐标方向”，会随车头旋转。
- * TURN_CCW表示从上往下看逆时针原地旋转，数值单位为度。
+ * TURN_CCW/TURN_CW表示从上往下看逆/顺时针原地旋转，数值单位为度。
  *
  *   Direction::FORWARD  ：沿当前车头方向前进
  *   Direction::BACKWARD ：沿当前车尾方向后退
  *   Direction::LEFT     ：相对当前车头向左横移
  *   Direction::RIGHT    ：相对当前车头向右横移
  *   Direction::TURN_CCW ：原地逆时针旋转指定角度
+ *   Direction::TURN_CW  ：原地顺时针旋转指定角度
  *
  * 场地左上角可视为坐标原点(0,0)，向右为X正方向，向下为Y正方向。
  * 规划路线使用的中心线坐标为150、1200、2250 mm。
@@ -43,21 +44,23 @@ static_assert(CARRIER_START_ZONE == 1 || CARRIER_START_ZONE == 2,
  * 表示小车向左横移800 mm，到达后仅作为普通路径点继续运行。
  *
  * 修改距离或旋转角度：只修改数组中的第二个数字。
- * 修改方向：把第一个参数改成FORWARD/BACKWARD/LEFT/RIGHT/TURN_CCW之一。
+ * 修改方向：使用FORWARD/BACKWARD/LEFT/RIGHT/TURN_CCW/TURN_CW之一。
  * 增加路线：在ROUTE[]中需要的位置插入一行。
  * 旋转示例：
  *   {Direction::TURN_CCW, 90, StopAction::NONE, "turn CCW 90 deg"}
+ *   {Direction::TURN_CW, 90, StopAction::NONE, "turn CW 90 deg"}
  * 删除路线：删除对应的一整行。
  * 调整停顿时间：修改CHECKPOINT_DWELL_MS。
  *
- * StopAction目前只用于串口说明和识别终点，不控制二维码或机械臂：
- *   NONE   = 普通路径点
- *   FINISH = 最后一段，抵达后关闭底盘驱动器
- *   其他值 = 作业区标记；底盘仍只停顿CHECKPOINT_DWELL_MS后继续
+ * StopAction用于识别作业点并触发对应动作：
+ *   NONE    = 普通路径点
+ *   QR_SCAN = 二维码板；停车等待有效的12位任务码
+ *   FINISH  = 最后一段，抵达后关闭底盘驱动器
+ *   其他值  = 作业区或机械臂动作标记
  *
  * 三、启动与安全
  * ---------------------------------------------------------------
- * 上电后程序只初始化电机和HWT101，四轮驱动器保持关闭并等待启动按钮。
+ * 上电后初始化电机、HWT101、夹爪、串口屏和扫码模块，四轮驱动器保持关闭。
  * 单击PB9启动按钮后从路线第1段开始；运行中单击则受控减速停车。
  * 安全停车后再次单击，会将路线状态清零并从第1段重新开始。
  * 调试串口：PB12(RX)、PB13(TX)、115200波特率。
@@ -86,8 +89,21 @@ constexpr uint16_t GRIPPER_MOVE_INTERVAL_MS = 800;
 constexpr uint16_t GRIPPER_MAX_POWER_MW = 400;
 constexpr uint32_t GRIPPER_ACTION_WAIT_MS = 1000;
 
+// 串口屏与GM75扫码模块配置，来自examples/QRcode.cpp。
+constexpr uint32_t TJCHMI_UART_RX_PIN = PB15;
+constexpr uint32_t TJCHMI_UART_TX_PIN = PB14;
+constexpr uint32_t TJCHMI_UART_BAUD = 115200;
+constexpr uint32_t QR_UART_RX_PIN = PE0;
+constexpr uint32_t QR_UART_TX_PIN = PE1;
+constexpr uint32_t QR_UART_BAUD = 9600;
+constexpr size_t QR_PAYLOAD_CAPACITY = 64;
+constexpr size_t TASK_CODE_DIGIT_COUNT = 12;
+
 constexpr uint32_t DRIVE_ENABLE_PIN = PE13;
+// 机械臂底部M5旋转轴：PE10低电平使能，PE15方向，PB11脉冲。
 constexpr uint32_t ROTATE_ENABLE_PIN = PE10;
+constexpr uint32_t ARM_BASE_DIR_PIN = PE15;
+constexpr uint32_t ARM_BASE_STEP_PIN = PB11;
 // 与Car_2和final原车程序一致：V2/V3控制板启动按钮使用PB9，按下接GND。
 // 早期V1资料曾使用PB8；如果你的实际控制板确为V1，只需把PB9改回PB8。
 constexpr uint32_t START_BUTTON_PIN = PB9;
@@ -112,6 +128,18 @@ constexpr int8_t MOTOR_POLARITY[4] = {-1, 1, -1, 1};
 // 修改后应分别标定前后移动和左右横移；若两者误差不同，建议拆成两个系数。
 constexpr float PULSES_PER_METER = 10000.0F;
 constexpr float PULSES_PER_MM = PULSES_PER_METER / 1000.0F;
+
+// 机械臂底部旋转轴：200步/圈、16细分、最新减速比5:1。
+// 输出轴90°所需脉冲 = 200 * 16 * 5 * 90 / 360 = 4000。
+constexpr float ARM_BASE_GEAR_RATIO = 5.0F;
+constexpr long ARM_BASE_MOTOR_PULSES_PER_REV = 200L * 16L;
+constexpr long ARM_BASE_90_DEG_PULSES =
+    static_cast<long>(ARM_BASE_MOTOR_PULSES_PER_REV *
+                      ARM_BASE_GEAR_RATIO * 90.0F / 360.0F);
+constexpr float ARM_BASE_MAX_SPEED_PPS = 1000.0F;
+constexpr float ARM_BASE_ACCELERATION_PPS2 = 500.0F;
+// 若首次测试发现正脉冲实际为逆时针，将1改成-1。
+constexpr int8_t ARM_BASE_CW_SIGN = -1;
 
 // AccelStepper使用的单位是“脉冲/秒”和“脉冲/秒²”，不是RPM。
 // MAX_SPEED越大，最高速度越高；ACCELERATION越大，加减速越急。
@@ -141,6 +169,8 @@ constexpr uint32_t CHECKPOINT_DWELL_MS = 500;
 
 HardwareSerial Serial_DEBUG(DEBUG_RX, DEBUG_TX);
 HardwareSerial Serial_GRIPPER(GRIPPER_UART_RX_PIN, GRIPPER_UART_TX_PIN);
+HardwareSerial Serial_TJCHMI(TJCHMI_UART_RX_PIN, TJCHMI_UART_TX_PIN);
+HardwareSerial Serial_QR(QR_UART_RX_PIN, QR_UART_TX_PIN);
 FSUS_Protocol gripperProtocol(&Serial_GRIPPER, GRIPPER_UART_BAUD);
 FSUS_Servo gripperServo(GRIPPER_SERVO_ID, &gripperProtocol);
 OneButton startButton;
@@ -149,13 +179,16 @@ AccelStepper motor1(MOTOR_INTERFACE_TYPE, M1_STEP_PIN, M1_DIR_PIN);
 AccelStepper motor2(MOTOR_INTERFACE_TYPE, M2_STEP_PIN, M2_DIR_PIN);
 AccelStepper motor3(MOTOR_INTERFACE_TYPE, M3_STEP_PIN, M3_DIR_PIN);
 AccelStepper motor4(MOTOR_INTERFACE_TYPE, M4_STEP_PIN, M4_DIR_PIN);
+AccelStepper armBaseStepper(
+    MOTOR_INTERFACE_TYPE, ARM_BASE_STEP_PIN, ARM_BASE_DIR_PIN);
 
 enum class Direction : uint8_t {
   FORWARD,
   BACKWARD,
   LEFT,
   RIGHT,
-  TURN_CCW
+  TURN_CCW,
+  TURN_CW
 };
 
 enum class StopAction : uint8_t {
@@ -167,13 +200,14 @@ enum class StopAction : uint8_t {
   PICK_BATCH_2,              // 第二批原料区位置标记
   PROCESS_AND_LOAD_BATCH_2,  // 第二批粗加工区位置标记
   STORE_BATCH_2,             // 第二批暂存区位置标记
+  ARM_BASE_RETURN_HOME,      // 小车在暂存区完成转向后，机械臂底座逆时针回零
   FINISH                     // 整条路线终点
 };
 
 // 一段路线的数据结构。ROUTE[]中的每一行都按这个顺序填写。
 struct RouteSegment {
   Direction direction;       // 本段运动方向
-  uint16_t amount;           // 平移段单位mm；TURN_CCW段单位为度
+  uint16_t amount;           // 平移段单位mm；TURN_CCW/TURN_CW段单位为度
   StopAction actionAtEnd;    // 到达后的点位类型
   const char *destination;   // 串口监视器显示的目的地名称
 };
@@ -183,11 +217,13 @@ struct RouteSegment {
 // CARRIER_ROUTE_START2.ino在包含本文件前把它定义为2。
 #if CARRIER_START_ZONE == 1
 constexpr Direction START_TO_QR_DIRECTION = Direction::BACKWARD;
-constexpr Direction RIGHT_LANE_TO_START_DIRECTION = Direction::FORWARD;
+// 当前旋转组合结束后车头朝图纸下方：返回上方启停区1应使用车体BACKWARD。
+constexpr Direction RIGHT_LANE_TO_START_DIRECTION = Direction::BACKWARD;
 constexpr const char *START_ZONE_NAME = "start zone 1";
 #else
 constexpr Direction START_TO_QR_DIRECTION = Direction::FORWARD;
-constexpr Direction RIGHT_LANE_TO_START_DIRECTION = Direction::BACKWARD;
+// 当前旋转组合结束后车头朝图纸下方：返回下方启停区2应使用车体FORWARD。
+constexpr Direction RIGHT_LANE_TO_START_DIRECTION = Direction::FORWARD;
 constexpr const char *START_ZONE_NAME = "start zone 2";
 #endif
 
@@ -211,62 +247,69 @@ constexpr RouteSegment ROUTE[] = {
     {START_TO_QR_DIRECTION, 1050, StopAction::QR_SCAN, "QR board"},
 
     // 3. 从右侧二维码板沿中央横向通道左移到场地中心
-    {Direction::LEFT, 1000, StopAction::NONE, "field center"},
+    {Direction::LEFT, 960, StopAction::NONE, "field center"},
 
-    // 4. 从场地中心沿中央纵向通道向上，到第一批原料区
-    {Direction::FORWARD, 900, StopAction::PICK_BATCH_1, "raw material area (batch 1)"},
-
-    // 5. 第一批到达原料区后，从上往下看逆时针旋转90°
+    // 4. 第一批到达原料区后，从上往下看逆时针旋转90°
     {Direction::TURN_CCW, 90, StopAction::NONE, "raw area CCW 90 deg (batch 1)"},
 
-    // 6. 车头已朝向图纸左侧；车体LEFT对应场地图纸向下，到粗加工区
-    {Direction::LEFT, 1800, StopAction::PROCESS_AND_LOAD_BATCH_1,
-     "rough processing area (batch 1)"},
+    // 5. 从场地中心沿中央纵向通道向上，到第一批原料区
+    {Direction::RIGHT, 990, StopAction::PICK_BATCH_1, "raw material area (batch 1)"},
 
-    // 7. 第一批到达粗加工区后，继续逆时针旋转180°
+    // 7.1 车头已朝向图纸右侧；车体RIGHT对应场地图纸向上，到MID
+    {Direction::LEFT, 30, StopAction::NONE,"MID"},
+
+    // 6. 原料区停留后，继续逆时针旋转180°
     {Direction::TURN_CCW, 180, StopAction::NONE, "rough area CCW 180 deg (batch 1)"},
 
-    // 8. 车头已朝向图纸右侧；车体LEFT对应图纸向上，回到场地中心
-    {Direction::LEFT, 900, StopAction::NONE, "field center"},
+    // 7.2 车头已朝向图纸右侧；车体RIGHT对应场地图纸向上，到粗加工区
+    {Direction::RIGHT, 1930, StopAction::PROCESS_AND_LOAD_BATCH_1,
+     "rough processing area (batch 1)"},
 
-    // 9. 车体BACKWARD对应图纸向左，到第一批暂存区
-    {Direction::BACKWARD, 900, StopAction::STORE_BATCH_1,
+    // 8. 车头已朝向图纸右侧；车体LEFT对应图纸向下，回到场地中心
+    {Direction::LEFT, 960, StopAction::NONE, "field center"},
+
+    // 9. 第一批到达中心后，从上往下看顺时针旋转90°，车头朝图纸下方
+    {Direction::TURN_CW, 90, StopAction::NONE, "storage CW 90 deg (batch 1)"},
+
+    // 10. 车体BACKWARD对应图纸向左，到第一批暂存区
+    {Direction::RIGHT, 950, StopAction::STORE_BATCH_1,
      "temporary storage (batch 1)"},
 
-    // 10. 第一批到达暂存区后，继续逆时针旋转90°，车头恢复朝图纸上方
-    {Direction::TURN_CCW, 90, StopAction::NONE, "storage CCW 90 deg (batch 1)"},
-
-    // 11. 第一批结束，从暂存区向右回到场地中心
-    {Direction::RIGHT, 900, StopAction::NONE, "field center"},
-
-    // 12. 从场地中心向上，第二次到原料区
-    {Direction::FORWARD, 900, StopAction::PICK_BATCH_2, "raw material area (batch 2)"},
-
-    // 13. 第二批到达原料区后，逆时针旋转90°
-    {Direction::TURN_CCW, 90, StopAction::NONE, "raw area CCW 90 deg (batch 2)"},
-
-    // 14. 第二批车体LEFT对应图纸向下，到粗加工区
-    {Direction::LEFT, 1800, StopAction::PROCESS_AND_LOAD_BATCH_2,
-     "rough processing area (batch 2)"},
-
-    // 15. 第二批到达粗加工区后，逆时针旋转180°
-    {Direction::TURN_CCW, 180, StopAction::NONE, "rough area CCW 180 deg (batch 2)"},
-
-    // 16. 车体LEFT对应图纸向上，回到场地中心
+    // 11. 车头朝下时，车体LEFT对应图纸向右，回到场地中心
     {Direction::LEFT, 900, StopAction::NONE, "field center"},
 
-    // 17. 车体BACKWARD对应图纸向左，到第二批暂存区
-    {Direction::BACKWARD, 900, StopAction::STORE_BATCH_2,
+    // 12. 第二批到达原料区后，逆时针旋转90°
+    {Direction::TURN_CW, 90, StopAction::NONE, "raw area CCW 90 deg (batch 2)"},
+
+    // 13. 车头朝下时，车体BACKWARD对应图纸向上，第二次到原料区
+    {Direction::RIGHT, 900, StopAction::PICK_BATCH_2,
+     "raw material area (batch 2)"},
+
+    // 14. 第二批到达粗加工区后，逆时针旋转180°
+    {Direction::TURN_CCW, 180, StopAction::NONE, "rough area CCW 180 deg (batch 2)"},
+
+    // 15. 此时车头朝图纸右侧；车体RIGHT对应图纸向下，到粗加工区
+    {Direction::RIGHT, 1800, StopAction::PROCESS_AND_LOAD_BATCH_2,
+     "rough processing area (batch 2)"},
+
+    // 16. 此时车头朝图纸左侧；车体RIGHT对应图纸向上，回到场地中心
+    {Direction::LEFT, 900, StopAction::NONE, "field center"},
+
+    // 17. 第二批到达暂存区后，先让小车完成原地转向；
+    //     本段结束时再触发机械臂底座逆时针90°回零
+    {Direction::TURN_CW, 90, StopAction::NONE,
+     "storage CW 90 deg (batch 2)"},
+
+    // 18. 车头朝左时，车体FORWARD对应图纸向左，到第二批暂存区
+    {Direction::RIGHT, 900, StopAction::STORE_BATCH_2,
      "temporary storage (batch 2)"},
 
-    // 18. 第二批到达暂存区后，逆时针旋转90°，车头恢复朝图纸上方
-    {Direction::TURN_CCW, 90, StopAction::NONE, "storage CCW 90 deg (batch 2)"},
-
     // 19. 两批完成，从左侧暂存区横穿场地到右侧通道
-    {Direction::RIGHT, 2000, StopAction::NONE, "right-side lane"},
+    {Direction::LEFT, 2000, StopAction::ARM_BASE_RETURN_HOME, "right-side lane"},
 
-    // 20. 启停区1向上返回；启停区2向下返回。FINISH会关闭四轮驱动器
-    {RIGHT_LANE_TO_START_DIRECTION, 1050, StopAction::FINISH, START_ZONE_NAME},
+    // 20. 此时车头朝图纸下方：启停区1用BACKWARD向上返回，
+    //     启停区2用FORWARD向下返回。FINISH会关闭四轮驱动器
+    {RIGHT_LANE_TO_START_DIRECTION, 1000, StopAction::FINISH, START_ZONE_NAME},
 };
 
 // 自动计算路线段数量。增删ROUTE[]内容时，不需要手工修改这个数。
@@ -278,6 +321,8 @@ enum class ProgramState : uint8_t {
   GRIPPER_CLOSING,  // 第一次单击后，夹爪正在回到上电时记录的夹紧原点
   WAITING_TO_START, // 夹爪已夹紧，等待第二次单击启动小车
   MOVING,           // 四个电机正在执行当前路线段
+  ARM_BASE_MOVING,  // 底盘停车，机械臂底部旋转轴正在执行90°动作
+  QR_SCANNING,      // 到达二维码板，停车等待有效的12位任务码
   CHECKPOINT_DWELL, // 已到达路线点，停车等待CHECKPOINT_DWELL_MS
   SAFE_STOPPING,    // 收到按钮单击，正在受控减速停车
   FINISHED,         // 整条路线完成，驱动器已关闭
@@ -287,8 +332,18 @@ enum class ProgramState : uint8_t {
 ProgramState programState = ProgramState::WAITING_TO_CLAMP;
 size_t routeIndex = 0;
 uint32_t checkpointStartTime = 0;
+bool armBaseStopRequested = false;
 bool gripperReady = false;
 uint32_t gripperActionStartTime = 0;
+char qrPayload[QR_PAYLOAD_CAPACITY] = {};
+char qrTaskCode[TASK_CODE_DIGIT_COUNT + 1] = {};
+// 串口屏固定分两行显示，保持现有字体大小：
+// 000+000
+// +000+000
+char qrTaskCodeDisplay[18] = "000+000\r\n+000+000";
+size_t qrDataIndex = 0;
+bool qrFrameOverflow = false;
+bool qrTaskReady = false;
 
 void beginGripperOpenCycle();
 
@@ -328,6 +383,8 @@ const char *directionName(Direction direction) {
       return "RIGHT";
     case Direction::TURN_CCW:
       return "TURN_CCW";
+    case Direction::TURN_CW:
+      return "TURN_CW";
   }
   return "UNKNOWN";
 }
@@ -348,6 +405,8 @@ const char *checkpointName(StopAction action) {
       return "rough processing area (batch 2)";
     case StopAction::STORE_BATCH_2:
       return "temporary storage (batch 2)";
+    case StopAction::ARM_BASE_RETURN_HOME:
+      return "arm base return home";
     case StopAction::FINISH:
       return "Route complete";
     case StopAction::NONE:
@@ -360,6 +419,11 @@ const char *checkpointName(StopAction action) {
 // 本项目PE13为低电平使能、高电平关闭。
 void setDriverEnabled(bool enabled) {
   digitalWrite(DRIVE_ENABLE_PIN, enabled ? LOW : HIGH);
+}
+
+// 机械臂底部M5驱动器同样为低电平使能。
+void setArmBaseEnabled(bool enabled) {
+  digitalWrite(ROTATE_ENABLE_PIN, enabled ? LOW : HIGH);
 }
 
 // 给每个AccelStepper对象设置相同的最大速度、加速度和软件零点。
@@ -519,7 +583,7 @@ void updateClosedLoopMotion() {
 }
 
 // 使用HWT101的连续yaw完成原地定角旋转。
-// unwrappedYawDeg消除了179°跳到-179°的问题，因此180°也能始终按逆时针执行。
+// unwrappedYawDeg消除了179°跳到-179°的问题，因此顺/逆时针180°都能按指定方向执行。
 bool updateRotationMotion() {
   const uint32_t nowUs = micros();
   float dt = static_cast<float>(nowUs - lastMotionUpdateUs) * 0.000001F;
@@ -567,14 +631,56 @@ bool updateRotationMotion() {
   return false;
 }
 
+// 第一次到达原料区时转到顺时针90°绝对位置；
+// 最后一次到达暂存区时回到软件零点，即逆时针90°。
+// 使用绝对目标可避免一次安全停车后重新启动时重复累加90°。
+void startArmBaseMove(bool moveClockwiseTo90Deg) {
+  stopWheelPulses();
+  armBaseStopRequested = false;
+  setArmBaseEnabled(true);
+
+  const long targetPulses =
+      moveClockwiseTo90Deg
+          ? static_cast<long>(ARM_BASE_CW_SIGN) * ARM_BASE_90_DEG_PULSES
+          : 0L;
+  armBaseStepper.moveTo(targetPulses);
+
+  Serial_DEBUG.print("Arm base: ");
+  Serial_DEBUG.print(moveClockwiseTo90Deg ? "CW 90 deg" : "CCW 90 deg to home");
+  Serial_DEBUG.print(", target pulses=");
+  Serial_DEBUG.println(targetPulses);
+  programState = ProgramState::ARM_BASE_MOVING;
+}
+
 void completeSafeStop() {
   stopWheelPulses();
   segmentIsRotation = false;
+  setArmBaseEnabled(false);
+  armBaseStopRequested = false;
   setDriverEnabled(false);
   routeIndex = 0;
   Serial_DEBUG.println(
       "Safe stop complete. Route reset; reopening gripper for the two-click restart.");
   beginGripperOpenCycle();
+}
+
+void updateArmBaseMotion() {
+  armBaseStepper.run();
+  if (armBaseStepper.distanceToGo() != 0) {
+    return;
+  }
+
+  setArmBaseEnabled(false);
+
+  if (armBaseStopRequested) {
+    completeSafeStop();
+    return;
+  }
+
+  Serial_DEBUG.print("Arm base: motion complete, position=");
+  Serial_DEBUG.println(armBaseStepper.currentPosition());
+  checkpointStartTime = millis();
+  programState = ProgramState::CHECKPOINT_DWELL;
 }
 
 // 按钮停车不直接切断驱动器，而是沿当前平移方向逐步降低四轮速度。
@@ -629,6 +735,140 @@ void updateSafeStopping() {
   }
 }
 
+void finishHmiCommand() {
+  Serial_TJCHMI.write(0xFF);
+  Serial_TJCHMI.write(0xFF);
+  Serial_TJCHMI.write(0xFF);
+}
+
+void setHmiText(const char *component, const char *text) {
+  Serial_TJCHMI.print(component);
+  Serial_TJCHMI.print(".txt=\"");
+  for (const char *p = text; *p != '\0'; ++p) {
+    const uint8_t value = static_cast<uint8_t>(*p);
+    // 淘晶驰文本控件通过串口接收CRLF实现换行，原样发送这两个控制字符。
+    if (*p == '\r' || *p == '\n') {
+      Serial_TJCHMI.write(value);
+    } else if (value < 0x20 || value > 0x7E || *p == '"' || *p == '\\') {
+      Serial_TJCHMI.write('?');
+    } else {
+      Serial_TJCHMI.write(value);
+    }
+  }
+  Serial_TJCHMI.write('"');
+  finishHmiCommand();
+}
+
+void showQrWaitingOnScreen() {
+  Serial_TJCHMI.print("page QR");
+  finishHmiCommand();
+  setHmiText("QR.t1", "QRWAIT");
+  setHmiText("QR.t2", "000+000\r\n+000+000");
+}
+
+void resetQrReception(bool updateScreen) {
+  qrPayload[0] = '\0';
+  qrTaskCode[0] = '\0';
+  strcpy(qrTaskCodeDisplay, "000+000\r\n+000+000");
+  qrDataIndex = 0;
+  qrFrameOverflow = false;
+  qrTaskReady = false;
+  while (Serial_QR.available() > 0) {
+    Serial_QR.read();
+  }
+  if (updateScreen) {
+    showQrWaitingOnScreen();
+  }
+}
+
+bool extractTwelveDigitTaskCode(const char *payload) {
+  size_t digitCount = 0;
+  for (const char *p = payload; *p != '\0'; ++p) {
+    if (*p >= '0' && *p <= '9') {
+      if (digitCount >= TASK_CODE_DIGIT_COUNT) {
+        return false;
+      }
+      qrTaskCode[digitCount++] = *p;
+    }
+  }
+  if (digitCount != TASK_CODE_DIGIT_COUNT) {
+    qrTaskCode[0] = '\0';
+    return false;
+  }
+  qrTaskCode[TASK_CODE_DIGIT_COUNT] = '\0';
+
+  size_t outputIndex = 0;
+  for (size_t i = 0; i < TASK_CODE_DIGIT_COUNT; ++i) {
+    if (i > 0 && i % 3 == 0) {
+      if (i == 6) {
+        qrTaskCodeDisplay[outputIndex++] = '\r';
+        qrTaskCodeDisplay[outputIndex++] = '\n';
+      }
+      qrTaskCodeDisplay[outputIndex++] = '+';
+    }
+    qrTaskCodeDisplay[outputIndex++] = qrTaskCode[i];
+  }
+  qrTaskCodeDisplay[outputIndex] = '\0';
+  return true;
+}
+
+void completeQrFrame() {
+  if (qrDataIndex == 0) {
+    return;
+  }
+
+  qrPayload[qrDataIndex] = '\0';
+  const bool validTaskCode =
+      !qrFrameOverflow && extractTwelveDigitTaskCode(qrPayload);
+  qrDataIndex = 0;
+  qrFrameOverflow = false;
+
+  if (!validTaskCode) {
+    setHmiText("QR.t1", "QRERR");
+    setHmiText("QR.t2", "INVALID TASK");
+    Serial_DEBUG.print("QR rejected (need exactly 12 digits): ");
+    Serial_DEBUG.println(qrPayload);
+    return;
+  }
+
+  qrTaskReady = true;
+  setHmiText("QR.t1", "QROK");
+  setHmiText("QR.t2", qrTaskCodeDisplay);
+  Serial_DEBUG.print("QR content: ");
+  Serial_DEBUG.println(qrPayload);
+  Serial_DEBUG.print("12-digit task code: ");
+  Serial_DEBUG.println(qrTaskCode);
+}
+
+// GM75默认以CR结束；也兼容CRLF或仅LF。接收过程不使用delay。
+void updateQrScanner() {
+  while (Serial_QR.available() > 0) {
+    const char incoming = static_cast<char>(Serial_QR.read());
+    if (incoming == '\r' || incoming == '\n') {
+      completeQrFrame();
+      continue;
+    }
+
+    if (qrTaskReady) {
+      continue;
+    }
+    if (qrDataIndex < QR_PAYLOAD_CAPACITY - 1) {
+      qrPayload[qrDataIndex++] = incoming;
+    } else {
+      qrFrameOverflow = true;
+    }
+  }
+}
+
+void beginQrScanCheckpoint() {
+  programState = ProgramState::QR_SCANNING;
+  if (!qrTaskReady) {
+    showQrWaitingOnScreen();
+    Serial_DEBUG.println(
+        "QR board: stopped, waiting for a QR code containing exactly 12 digits.");
+  }
+}
+
 const char *programStateName() {
   switch (programState) {
     case ProgramState::GRIPPER_OPENING:
@@ -641,6 +881,10 @@ const char *programStateName() {
       return "GRIPPER_CLOSE";
     case ProgramState::MOVING:
       return "MOVING";
+    case ProgramState::ARM_BASE_MOVING:
+      return "ARM_BASE";
+    case ProgramState::QR_SCANNING:
+      return "QR_SCAN";
     case ProgramState::CHECKPOINT_DWELL:
       return "DWELL";
     case ProgramState::SAFE_STOPPING:
@@ -725,7 +969,9 @@ void reportRawButtonEdge() {
  *   右移： + - - +
  */
 void startSegment(const RouteSegment &segment) {
-  segmentIsRotation = (segment.direction == Direction::TURN_CCW);
+  segmentIsRotation =
+      (segment.direction == Direction::TURN_CCW ||
+       segment.direction == Direction::TURN_CW);
   segmentBaseSpeedPps = 0.0F;
   headingCorrectionPps = 0.0F;
   rotationDriveSign = 0.0F;
@@ -733,8 +979,12 @@ void startSegment(const RouteSegment &segment) {
 
   if (segmentIsRotation) {
     segmentTargetPulses = 0;
+    const float requestedYawSign =
+        (segment.direction == Direction::TURN_CCW)
+            ? CCW_YAW_SIGN
+            : -CCW_YAW_SIGN;
     turnTargetUnwrappedYawDeg =
-        unwrappedYawDeg + CCW_YAW_SIGN * static_cast<float>(segment.amount);
+        unwrappedYawDeg + requestedYawSign * static_cast<float>(segment.amount);
     targetYawDeg = wrapAngleDeg(turnTargetUnwrappedYawDeg);
   } else {
     segmentTargetPulses = lroundf(segment.amount * PULSES_PER_MM);
@@ -766,6 +1016,7 @@ void startSegment(const RouteSegment &segment) {
       translationSigns[3] = 1;
       break;
     case Direction::TURN_CCW:
+    case Direction::TURN_CW:
       translationSigns[0] = 0;
       translationSigns[1] = 0;
       translationSigns[2] = 0;
@@ -817,7 +1068,10 @@ void startRouteFromBeginning() {
   stopWheelPulses();
   targetYawDeg = currentYawDeg;
   segmentIsRotation = false;
+  armBaseStopRequested = false;
+  setArmBaseEnabled(false);
   routeIndex = 0;
+  resetQrReception(false);
   setDriverEnabled(true);
 
   Serial_DEBUG.print("Start button: route restarted from segment 1, target yaw=");
@@ -885,6 +1139,19 @@ void updateInitialGripperClamp() {
 }
 
 void requestSafeStop() {
+  if (programState == ProgramState::ARM_BASE_MOVING) {
+    armBaseStopRequested = true;
+    if (fabsf(armBaseStepper.speed()) > 0.0F) {
+      armBaseStepper.stop();
+    } else {
+      // 刚进入动作但尚未产生第一步时，stop()不会改变目标，因此显式取消。
+      armBaseStepper.moveTo(armBaseStepper.currentPosition());
+    }
+    Serial_DEBUG.println(
+        "Start button: arm base controlled stop requested.");
+    return;
+  }
+
   if (programState == ProgramState::MOVING) {
     lastMotionUpdateUs = micros();
     programState = ProgramState::SAFE_STOPPING;
@@ -893,7 +1160,8 @@ void requestSafeStop() {
   }
 
   // 路径点停顿期间轮速本来就是零，直接完成安全停车。
-  if (programState == ProgramState::CHECKPOINT_DWELL) {
+  if (programState == ProgramState::QR_SCANNING ||
+      programState == ProgramState::CHECKPOINT_DWELL) {
     completeSafeStop();
   }
 }
@@ -911,6 +1179,7 @@ void handleArrival() {
   if (segment.actionAtEnd == StopAction::FINISH) {
     Serial_DEBUG.println(
         "Route complete. Wheel drivers disabled; reopening gripper.");
+    setArmBaseEnabled(false);
     setDriverEnabled(false);
     routeIndex = 0;
     beginGripperOpenCycle();
@@ -924,6 +1193,23 @@ void handleArrival() {
     Serial_DEBUG.println(checkpointName(segment.actionAtEnd));
   }
 
+  // 第一批首次到达原料区：机械臂底座从软件零点顺时针转到+90°。
+  // 第二批到达暂存区后先执行下一段小车转向；该转向段完成时，
+  // ARM_BASE_RETURN_HOME再触发底座逆时针90°返回软件零点。
+  // 两个动作均为非阻塞状态；完成前不会启动下一段底盘路线。
+  if (segment.actionAtEnd == StopAction::PICK_BATCH_1) {
+    startArmBaseMove(true);
+    return;
+  }
+  if (segment.actionAtEnd == StopAction::ARM_BASE_RETURN_HOME) {
+    startArmBaseMove(false);
+    return;
+  }
+  if (segment.actionAtEnd == StopAction::QR_SCAN) {
+    beginQrScanCheckpoint();
+    return;
+  }
+
   // 每个路径点短暂停车，然后loop()自动启动下一段，不需要人工确认。
   checkpointStartTime = millis();
   programState = ProgramState::CHECKPOINT_DWELL;
@@ -934,6 +1220,8 @@ void handleArrival() {
 void emergencyStop() {
   stopWheelPulses();
   segmentIsRotation = false;
+  setArmBaseEnabled(false);
+  armBaseStopRequested = false;
   setDriverEnabled(false);
   programState = ProgramState::EMERGENCY_STOP;
   Serial_DEBUG.println("EMERGENCY STOP: wheel drivers disabled. Reset to restart.");
@@ -942,6 +1230,8 @@ void emergencyStop() {
 void imuFaultStop() {
   stopWheelPulses();
   segmentIsRotation = false;
+  setArmBaseEnabled(false);
+  armBaseStopRequested = false;
   setDriverEnabled(false);
   programState = ProgramState::EMERGENCY_STOP;
   Serial_DEBUG.println(
@@ -974,6 +1264,8 @@ void onStartButtonClick() {
       break;
 
     case ProgramState::MOVING:
+    case ProgramState::ARM_BASE_MOVING:
+    case ProgramState::QR_SCANNING:
     case ProgramState::CHECKPOINT_DWELL:
       requestSafeStop();
       break;
@@ -1018,6 +1310,16 @@ void setup() {
   Serial_DEBUG.println("[BOOT 1] PB13 debug TX started at 115200.");
   Serial_DEBUG.flush();
 
+  Serial_TJCHMI.begin(TJCHMI_UART_BAUD);
+  Serial_QR.begin(QR_UART_BAUD);
+  delay(200);
+  while (Serial_TJCHMI.read() >= 0) {
+  }
+  resetQrReception(true);
+  Serial_DEBUG.println(
+      "[BOOT QR] Screen PB15/PB14@115200; GM75 PE0/PE1@9600.");
+  Serial_DEBUG.flush();
+
   // 在任何可能等待通信设备的初始化之前，先可靠关闭底盘和机械臂底座驱动器。
   pinMode(DRIVE_ENABLE_PIN, OUTPUT);
   pinMode(ROTATE_ENABLE_PIN, OUTPUT);
@@ -1048,8 +1350,8 @@ void setup() {
   pinMode(DRIVE_ENABLE_PIN, OUTPUT);
   pinMode(ROTATE_ENABLE_PIN, OUTPUT);
 
-  // 与STEP4/FSM_SQUARE相同：PE13低电平使能底盘四个步进驱动器。
-  // PE10属于机械臂底座旋转轴，本底盘程序不使用，因此保持高电平关闭。
+  // PE13和PE10都为低电平使能。上电时先保持两个驱动器关闭，
+  // 底盘等待PB9启动；机械臂底座只在两个指定检查点短暂使能。
   digitalWrite(ROTATE_ENABLE_PIN, HIGH);
   // 上电时不使能底盘，必须等待PB9按钮单击。
   digitalWrite(DRIVE_ENABLE_PIN, HIGH);
@@ -1058,6 +1360,10 @@ void setup() {
   configureMotor(motor2);
   configureMotor(motor3);
   configureMotor(motor4);
+  armBaseStepper.setMaxSpeed(ARM_BASE_MAX_SPEED_PPS);
+  armBaseStepper.setAcceleration(ARM_BASE_ACCELERATION_PPS2);
+  // 软件零点对应机械臂初始朝向。上电前必须人工确认底座位于该位置。
+  armBaseStepper.setCurrentPosition(0);
 
   // PB9使用内部上拉：松开为HIGH，按钮按下接GND后为LOW。
   startButton.setup(START_BUTTON_PIN, INPUT_PULLUP, true);
@@ -1084,7 +1390,7 @@ void setup() {
   Serial_DEBUG.println("WARNING: verify wheel directions and distance calibration with the chassis raised.");
 
   // 等待HWT101持续输出数据，并把上电时的实际车头方向设为初始目标航向。
-  // 每个TURN_CCW段完成后，程序会把旋转后的角度设为后续直线段的新目标航向。
+  // 每个旋转段完成后，程序会把旋转后的角度设为后续直线段的新目标航向。
   // 等待期间只读传感器、不驱动车轮，因此不需要人工测量绝对yaw值。
   const uint32_t imuWaitStart = millis();
   uint32_t lastImuBootReportMs = imuWaitStart;
@@ -1126,6 +1432,7 @@ void setup() {
 void loop() {
   // HWT101必须在所有程序状态中持续读取，避免UART接收缓存溢出。
   updateImu();
+  updateQrScanner();
 
   // OneButton依靠高频tick()完成消抖和单击识别，不能用长delay阻塞。
   startButton.tick();
@@ -1137,6 +1444,17 @@ void loop() {
   // 同步反馈到电脑串口；即使下面的状态分支提前return，也不会停止上报。
   reportImuToComputer();
 
+  // 二维码点保持停车，收到且解析出恰好12位数字后才进入下一段。
+  if (programState == ProgramState::QR_SCANNING) {
+    if (qrTaskReady) {
+      Serial_DEBUG.println("QR accepted. Route will continue.");
+      checkpointStartTime = millis();
+      programState = ProgramState::CHECKPOINT_DWELL;
+    }
+    delay(1);
+    return;
+  }
+
   // 张开和夹紧均采用非阻塞计时，期间按钮、HWT101和串口仍持续工作。
   if (programState == ProgramState::GRIPPER_OPENING) {
     updateGripperOpening();
@@ -1147,6 +1465,12 @@ void loop() {
   if (programState == ProgramState::GRIPPER_CLOSING) {
     updateInitialGripperClamp();
     delay(1);
+    return;
+  }
+
+  // 机械臂底座动作期间底盘保持停止，只运行M5的AccelStepper脉冲。
+  if (programState == ProgramState::ARM_BASE_MOVING) {
+    updateArmBaseMotion();
     return;
   }
 

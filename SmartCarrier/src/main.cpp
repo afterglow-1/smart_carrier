@@ -3,6 +3,9 @@
 #include <FashionStar_SmartGripper.h>
 #include <JY901.h>
 #include <OneButton.h>
+#include <TTL_STEPPER.h>
+#include <MaixCircleProtocol.hpp>
+#include <VisualAlignmentController.hpp>
 
 #ifndef CARRIER_START_ZONE
 #define CARRIER_START_ZONE 1
@@ -52,14 +55,15 @@ static_assert(CARRIER_START_ZONE == 1 || CARRIER_START_ZONE == 2,
  * 删除路线：删除对应的一整行。
  * 调整停顿时间：修改CHECKPOINT_DWELL_MS。
  *
- * StopAction目前只用于串口说明和识别终点，不控制二维码或机械臂：
- *   NONE   = 普通路径点
- *   FINISH = 最后一段，抵达后关闭底盘驱动器
- *   其他值 = 作业区标记；底盘仍只停顿CHECKPOINT_DWELL_MS后继续
+ * StopAction用于识别作业点并触发对应动作：
+ *   NONE    = 普通路径点
+ *   QR_SCAN = 二维码板；停车等待有效的12位任务码
+ *   FINISH  = 最后一段，抵达后关闭底盘驱动器
+ *   其他值  = 作业区或机械臂动作标记
  *
  * 三、启动与安全
  * ---------------------------------------------------------------
- * 上电后程序只初始化电机和HWT101，四轮驱动器保持关闭并等待启动按钮。
+ * 上电后初始化电机、HWT101、夹爪、串口屏和扫码模块，四轮驱动器保持关闭。
  * 单击PB9启动按钮后从路线第1段开始；运行中单击则受控减速停车。
  * 安全停车后再次单击，会将路线状态清零并从第1段重新开始。
  * 调试串口：PB12(RX)、PB13(TX)、115200波特率。
@@ -87,6 +91,45 @@ constexpr float GRIPPER_CLOSE_ANGLE_DEG = 0.0F;
 constexpr uint16_t GRIPPER_MOVE_INTERVAL_MS = 800;
 constexpr uint16_t GRIPPER_MAX_POWER_MW = 400;
 constexpr uint32_t GRIPPER_ACTION_WAIT_MS = 1000;
+
+// 串口屏与GM75扫码模块配置，来自examples/QRcode.cpp。
+constexpr uint32_t TJCHMI_UART_RX_PIN = PB15;
+constexpr uint32_t TJCHMI_UART_TX_PIN = PB14;
+constexpr uint32_t TJCHMI_UART_BAUD = 115200;
+constexpr uint32_t QR_UART_RX_PIN = PE0;
+constexpr uint32_t QR_UART_TX_PIN = PE1;
+constexpr uint32_t QR_UART_BAUD = 9600;
+constexpr size_t QR_PAYLOAD_CAPACITY = 64;
+constexpr size_t TASK_CODE_DIGIT_COUNT = 12;
+
+// MaixCAM Pro：A16(TX)->PE7(RX)，A17(RX)<-PE8(TX)，与CircleRecognize.py一致。
+constexpr uint32_t MAIX_UART_RX_PIN = PE7;
+constexpr uint32_t MAIX_UART_TX_PIN = PE8;
+constexpr uint32_t MAIX_UART_BAUD = 115200;
+constexpr uint32_t MAIX_MODE_WARMUP_MS = 300;
+constexpr uint32_t MAIX_REQUEST_INTERVAL_MS = 100;
+
+// ID6水平齿轮齿条轴，接线和机械参数沿用final设计。
+constexpr uint32_t ARM_STEPPER_UART_RX_PIN = PA3;
+constexpr uint32_t ARM_STEPPER_UART_TX_PIN = PA2;
+constexpr uint32_t ARM_STEPPER_UART_BAUD = 115200;
+constexpr uint8_t HORIZONTAL_STEPPER_ID = 6;
+constexpr uint16_t HORIZONTAL_SPEED_RPM = 1000;
+constexpr uint8_t HORIZONTAL_ACCELERATION = 240;
+constexpr bool HORIZONTAL_POSITIVE_DIRECTION = 1;
+constexpr float HORIZONTAL_TRAVEL_PER_REV_TENTH_MM =
+    PI * 1.0F * 36.0F * 10.0F;
+constexpr uint16_t HORIZONTAL_SUBSTEPS = 256;
+constexpr float HORIZONTAL_MIN_POSITION_TENTH_MM = 0.0F;
+constexpr float HORIZONTAL_MAX_POSITION_TENTH_MM = 1500.0F;
+constexpr uint32_t HORIZONTAL_STATE_POLL_MS = 20;
+
+// 像素闭环标定。目标点应在夹爪中心与圆心重合时实机示教。
+// 若某一轴修正后误差增大，只反转对应系数的符号。
+constexpr float VISION_TARGET_X_PX = 160.0F;
+constexpr float VISION_TARGET_Y_PX = 120.0F;
+constexpr float VISION_BASE_DEG_PER_PIXEL_X = 0.05F;
+constexpr float VISION_EXTENSION_MM_PER_PIXEL_Y = 0.20F;
 
 constexpr uint32_t DRIVE_ENABLE_PIN = PE13;
 // 机械臂底部M5旋转轴：PE10低电平使能，PE15方向，PB11脉冲。
@@ -158,8 +201,17 @@ constexpr uint32_t CHECKPOINT_DWELL_MS = 500;
 
 HardwareSerial Serial_DEBUG(DEBUG_RX, DEBUG_TX);
 HardwareSerial Serial_GRIPPER(GRIPPER_UART_RX_PIN, GRIPPER_UART_TX_PIN);
+HardwareSerial Serial_TJCHMI(TJCHMI_UART_RX_PIN, TJCHMI_UART_TX_PIN);
+HardwareSerial Serial_QR(QR_UART_RX_PIN, QR_UART_TX_PIN);
+HardwareSerial Serial_MAIX(MAIX_UART_RX_PIN, MAIX_UART_TX_PIN);
+HardwareSerial Serial_ARM_STEPPER(
+    ARM_STEPPER_UART_RX_PIN, ARM_STEPPER_UART_TX_PIN);
 FSUS_Protocol gripperProtocol(&Serial_GRIPPER, GRIPPER_UART_BAUD);
 FSUS_Servo gripperServo(GRIPPER_SERVO_ID, &gripperProtocol);
+TTL_Protocol armStepperProtocol(
+    &Serial_ARM_STEPPER, ARM_STEPPER_UART_BAUD);
+TTL_Stepper horizontalStepper(
+    HORIZONTAL_STEPPER_ID, &armStepperProtocol);
 OneButton startButton;
 
 AccelStepper motor1(MOTOR_INTERFACE_TYPE, M1_STEP_PIN, M1_DIR_PIN);
@@ -168,6 +220,21 @@ AccelStepper motor3(MOTOR_INTERFACE_TYPE, M3_STEP_PIN, M3_DIR_PIN);
 AccelStepper motor4(MOTOR_INTERFACE_TYPE, M4_STEP_PIN, M4_DIR_PIN);
 AccelStepper armBaseStepper(
     MOTOR_INTERFACE_TYPE, ARM_BASE_STEP_PIN, ARM_BASE_DIR_PIN);
+
+class FineAlignmentMotorAdapter
+    : public smartcarrier::AlignmentMotorPort {
+ public:
+  bool moveChassisRelative(float, float) override { return false; }
+  bool rotateArmBaseRelative(float degrees) override;
+  bool moveExtensionRelative(float millimeters) override;
+  bool isMotionBusy() override;
+  void stopAllAlignmentMotors() override;
+};
+
+FineAlignmentMotorAdapter fineAlignmentMotors;
+smartcarrier::VisualAlignmentController visualAlignment(
+    fineAlignmentMotors);
+smartcarrier::MaixCirclePacketParser maixCircleParser;
 
 enum class Direction : uint8_t {
   FORWARD,
@@ -234,13 +301,13 @@ constexpr RouteSegment ROUTE[] = {
     {START_TO_QR_DIRECTION, 1050, StopAction::QR_SCAN, "QR board"},
 
     // 3. 从右侧二维码板沿中央横向通道左移到场地中心
-    {Direction::LEFT, 960, StopAction::NONE, "field center"},
+    {Direction::LEFT, 970, StopAction::NONE, "field center"},
 
     // 4. 第一批到达原料区后，从上往下看逆时针旋转90°
     {Direction::TURN_CCW, 90, StopAction::NONE, "raw area CCW 90 deg (batch 1)"},
 
     // 5. 从场地中心沿中央纵向通道向上，到第一批原料区
-    {Direction::RIGHT, 990, StopAction::PICK_BATCH_1, "raw material area (batch 1)"},
+    {Direction::RIGHT, 960, StopAction::PICK_BATCH_1, "raw material area (batch 1)"},
 
     // 7.1 车头已朝向图纸右侧；车体RIGHT对应场地图纸向上，到MID
     {Direction::LEFT, 30, StopAction::NONE,"MID"},
@@ -249,54 +316,58 @@ constexpr RouteSegment ROUTE[] = {
     {Direction::TURN_CCW, 180, StopAction::NONE, "rough area CCW 180 deg (batch 1)"},
 
     // 7.2 车头已朝向图纸右侧；车体RIGHT对应场地图纸向上，到粗加工区
-    {Direction::RIGHT, 1930, StopAction::PROCESS_AND_LOAD_BATCH_1,
+    {Direction::RIGHT, 1900, StopAction::PROCESS_AND_LOAD_BATCH_1,
      "rough processing area (batch 1)"},
 
     // 8. 车头已朝向图纸右侧；车体LEFT对应图纸向下，回到场地中心
-    {Direction::LEFT, 960, StopAction::NONE, "field center"},
+    {Direction::LEFT, 945, StopAction::NONE, "field center"},
 
     // 9. 第一批到达中心后，从上往下看顺时针旋转90°，车头朝图纸下方
     {Direction::TURN_CW, 90, StopAction::NONE, "storage CW 90 deg (batch 1)"},
 
     // 10. 车体BACKWARD对应图纸向左，到第一批暂存区
-    {Direction::RIGHT, 950, StopAction::STORE_BATCH_1,
+    {Direction::RIGHT, 940, StopAction::STORE_BATCH_1,
      "temporary storage (batch 1)"},
 
     // 11. 车头朝下时，车体LEFT对应图纸向右，回到场地中心
-    {Direction::LEFT, 900, StopAction::NONE, "field center"},
+    {Direction::LEFT, 930, StopAction::NONE, "field center"},
 
     // 12. 第二批到达原料区后，逆时针旋转90°
     {Direction::TURN_CW, 90, StopAction::NONE, "raw area CCW 90 deg (batch 2)"},
 
     // 13. 车头朝下时，车体BACKWARD对应图纸向上，第二次到原料区
-    {Direction::RIGHT, 900, StopAction::PICK_BATCH_2,
+    {Direction::RIGHT, 970, StopAction::PICK_BATCH_2,
      "raw material area (batch 2)"},
+
+    // 15.1. 此时车头朝图纸右侧；车体RIGHT对应图纸向下，到粗加工区
+    {Direction::LEFT, 30, StopAction::PROCESS_AND_LOAD_BATCH_2,
+     "rough processing area (batch 2)"},
 
     // 14. 第二批到达粗加工区后，逆时针旋转180°
     {Direction::TURN_CCW, 180, StopAction::NONE, "rough area CCW 180 deg (batch 2)"},
 
-    // 15. 此时车头朝图纸右侧；车体RIGHT对应图纸向下，到粗加工区
-    {Direction::RIGHT, 1800, StopAction::PROCESS_AND_LOAD_BATCH_2,
+    // 15.2. 此时车头朝图纸右侧；车体RIGHT对应图纸向下，到粗加工区
+    {Direction::RIGHT, 1895, StopAction::PROCESS_AND_LOAD_BATCH_2,
      "rough processing area (batch 2)"},
 
     // 16. 此时车头朝图纸左侧；车体RIGHT对应图纸向上，回到场地中心
-    {Direction::LEFT, 900, StopAction::NONE, "field center"},
+    {Direction::LEFT, 960, StopAction::NONE, "field center"},
 
-    // 17. 第二批到达暂存区后，先让小车完成原地转向；
-    //     本段结束时再触发机械臂底座逆时针90°回零
+    // 17. 第二批到达暂存区前，先让小车完成原地转向；
+
     {Direction::TURN_CW, 90, StopAction::NONE,
      "storage CW 90 deg (batch 2)"},
 
     // 18. 车头朝左时，车体FORWARD对应图纸向左，到第二批暂存区
-    {Direction::RIGHT, 900, StopAction::STORE_BATCH_2,
+    {Direction::RIGHT, 940, StopAction::STORE_BATCH_2,
      "temporary storage (batch 2)"},
 
-    // 19. 两批完成，从左侧暂存区横穿场地到右侧通道
-    {Direction::LEFT, 2000, StopAction::ARM_BASE_RETURN_HOME, "right-side lane"},
+    // 19. 两批完成，从左侧暂存区横穿场地到右侧通道    //     本段结束时再触发机械臂底座逆时针90°回零
+    {Direction::LEFT, 2010, StopAction::ARM_BASE_RETURN_HOME, "right-side lane"},
 
     // 20. 此时车头朝图纸下方：启停区1用BACKWARD向上返回，
     //     启停区2用FORWARD向下返回。FINISH会关闭四轮驱动器
-    {RIGHT_LANE_TO_START_DIRECTION, 1000, StopAction::FINISH, START_ZONE_NAME},
+    {RIGHT_LANE_TO_START_DIRECTION, 1060, StopAction::FINISH, START_ZONE_NAME},
 };
 
 // 自动计算路线段数量。增删ROUTE[]内容时，不需要手工修改这个数。
@@ -309,6 +380,8 @@ enum class ProgramState : uint8_t {
   WAITING_TO_START, // 夹爪已夹紧，等待第二次单击启动小车
   MOVING,           // 四个电机正在执行当前路线段
   ARM_BASE_MOVING,  // 底盘停车，机械臂底部旋转轴正在执行90°动作
+  VISUAL_ALIGNING,  // M5旋转轴和ID6水平轴正在执行圆心闭环精调
+  QR_SCANNING,      // 到达二维码板，停车等待有效的12位任务码
   CHECKPOINT_DWELL, // 已到达路线点，停车等待CHECKPOINT_DWELL_MS
   SAFE_STOPPING,    // 收到按钮单击，正在受控减速停车
   FINISHED,         // 整条路线完成，驱动器已关闭
@@ -321,8 +394,33 @@ uint32_t checkpointStartTime = 0;
 bool armBaseStopRequested = false;
 bool gripperReady = false;
 uint32_t gripperActionStartTime = 0;
+char qrPayload[QR_PAYLOAD_CAPACITY] = {};
+char qrTaskCode[TASK_CODE_DIGIT_COUNT + 1] = {};
+// 串口屏固定分两行显示，保持现有字体大小：
+// 000+000
+// +000+000
+char qrTaskCodeDisplay[18] = "000+000\r\n+000+000";
+size_t qrDataIndex = 0;
+bool qrFrameOverflow = false;
+bool qrTaskReady = false;
+
+enum class FineMotorMode : uint8_t {
+  IDLE,
+  ARM_BASE,
+  HORIZONTAL
+};
+
+FineMotorMode fineMotorMode = FineMotorMode::IDLE;
+float horizontalTargetTenthMm = 0.0F;
+uint32_t lastHorizontalStatePollMs = 0;
+uint32_t maixCircleModeStartedMs = 0;
+uint32_t lastMaixRequestMs = 0;
+uint32_t lastMaixDebugMs = 0;
+bool horizontalStepperReady = false;
 
 void beginGripperOpenCycle();
+void emergencyStop();
+void imuFaultStop();
 
 // 以下方向均为乘MOTOR_POLARITY之前的“逻辑轮方向”。
 constexpr int8_t ROTATION_SIGNS[4] = {1, -1, 1, -1};
@@ -660,6 +758,307 @@ void updateArmBaseMotion() {
   programState = ProgramState::CHECKPOINT_DWELL;
 }
 
+bool FineAlignmentMotorAdapter::rotateArmBaseRelative(float degrees) {
+  if (fineMotorMode != FineMotorMode::IDLE) {
+    return false;
+  }
+
+  constexpr float pulsesPerDegree =
+      static_cast<float>(ARM_BASE_MOTOR_PULSES_PER_REV) *
+      ARM_BASE_GEAR_RATIO / 360.0F;
+  constexpr float minimumClockwiseAngleDeg = 0.0F;
+  constexpr float maximumClockwiseAngleDeg = 140.0F;
+
+  const float currentClockwiseAngleDeg =
+      static_cast<float>(armBaseStepper.currentPosition()) /
+      (static_cast<float>(ARM_BASE_CW_SIGN) * pulsesPerDegree);
+  const float targetClockwiseAngleDeg =
+      constrain(currentClockwiseAngleDeg + degrees,
+                minimumClockwiseAngleDeg,
+                maximumClockwiseAngleDeg);
+  const long targetPulses = lroundf(
+      targetClockwiseAngleDeg *
+      static_cast<float>(ARM_BASE_CW_SIGN) * pulsesPerDegree);
+  if (targetPulses == armBaseStepper.currentPosition()) {
+    return false;
+  }
+
+  setArmBaseEnabled(true);
+  armBaseStepper.moveTo(targetPulses);
+  fineMotorMode = FineMotorMode::ARM_BASE;
+
+  Serial_DEBUG.print("Vision M5: relative=");
+  Serial_DEBUG.print(degrees, 3);
+  Serial_DEBUG.print(" deg, target=");
+  Serial_DEBUG.print(targetClockwiseAngleDeg, 3);
+  Serial_DEBUG.println(" deg CW");
+  return true;
+}
+
+bool FineAlignmentMotorAdapter::moveExtensionRelative(
+    float millimeters) {
+  if (fineMotorMode != FineMotorMode::IDLE ||
+      !horizontalStepperReady) {
+    return false;
+  }
+
+  const float requestedTarget =
+      horizontalTargetTenthMm + millimeters * 10.0F;
+  const float limitedTarget =
+      constrain(requestedTarget,
+                HORIZONTAL_MIN_POSITION_TENTH_MM,
+                HORIZONTAL_MAX_POSITION_TENTH_MM);
+  if (fabsf(limitedTarget - horizontalTargetTenthMm) < 0.5F) {
+    return false;
+  }
+
+  horizontalStepper.onPos_state = false;
+  horizontalStepper.locked_state = false;
+  horizontalStepper.loPro_state = false;
+  horizontalStepper.recDate_Clear();
+  horizontalStepper.runToNewPosition(limitedTarget);
+  if (!horizontalStepper.command_check) {
+    return false;
+  }
+
+  horizontalTargetTenthMm = limitedTarget;
+  lastHorizontalStatePollMs = 0;
+  fineMotorMode = FineMotorMode::HORIZONTAL;
+
+  Serial_DEBUG.print("Vision ID6: relative=");
+  Serial_DEBUG.print(millimeters, 2);
+  Serial_DEBUG.print(" mm, target=");
+  Serial_DEBUG.print(horizontalTargetTenthMm * 0.1F, 2);
+  Serial_DEBUG.println(" mm");
+  return true;
+}
+
+bool FineAlignmentMotorAdapter::isMotionBusy() {
+  switch (fineMotorMode) {
+    case FineMotorMode::ARM_BASE:
+      armBaseStepper.run();
+      if (armBaseStepper.distanceToGo() != 0) {
+        return true;
+      }
+      setArmBaseEnabled(false);
+      fineMotorMode = FineMotorMode::IDLE;
+      return false;
+
+    case FineMotorMode::HORIZONTAL: {
+      const uint32_t nowMs = millis();
+      if (nowMs - lastHorizontalStatePollMs >=
+          HORIZONTAL_STATE_POLL_MS) {
+        lastHorizontalStatePollMs = nowMs;
+        horizontalStepper.state_update();
+      }
+      if (horizontalStepper.locked_state ||
+          horizontalStepper.loPro_state ||
+          !horizontalStepper.onPos_state) {
+        return true;
+      }
+      horizontalStepper.recDate_Clear();
+      fineMotorMode = FineMotorMode::IDLE;
+      return false;
+    }
+
+    case FineMotorMode::IDLE:
+      return false;
+  }
+  return false;
+}
+
+void FineAlignmentMotorAdapter::stopAllAlignmentMotors() {
+  armBaseStepper.moveTo(armBaseStepper.currentPosition());
+  setArmBaseEnabled(false);
+  armStepperProtocol.Emm_V5_Stop_Now(
+      HORIZONTAL_STEPPER_ID, false);
+  horizontalStepper.recDate_Clear();
+  fineMotorMode = FineMotorMode::IDLE;
+}
+
+void setMaixColorMode() {
+  Serial_MAIX.write(
+      smartcarrier::MAIX_SET_COLOR_MODE,
+      sizeof(smartcarrier::MAIX_SET_COLOR_MODE));
+}
+
+void configureVisualAlignment() {
+  smartcarrier::VisualAlignmentConfig config;
+  config.enableChassisCorrection = false;
+  config.targetCenterXpx = VISION_TARGET_X_PX;
+  config.targetCenterYpx = VISION_TARGET_Y_PX;
+  config.coarseThresholdPx = 25.0F;
+  config.fineToleranceXpx = 3.0F;
+  config.fineToleranceYpx = 3.0F;
+  config.requiredStableFrames = 4;
+  config.minimumRadiusPx = 25.0F;
+  config.maximumRadiusPx = 115.0F;
+  config.minimumConfidence = 20.0F;
+
+  config.armBaseDegPerPixelX =
+      VISION_BASE_DEG_PER_PIXEL_X;
+  config.extensionMmPerPixelY =
+      VISION_EXTENSION_MM_PER_PIXEL_Y;
+  config.maximumArmBaseStepDeg = 2.0F;
+  config.minimumArmBaseStepDeg = 0.1F;
+  config.maximumExtensionStepMm = 5.0F;
+  config.minimumExtensionStepMm = 0.3F;
+  config.sampleTimeoutMs = 1500;
+  config.motionTimeoutMs = 5000;
+  config.settleTimeMs = 200;
+  config.maximumLostFrames = 6;
+  config.maximumCorrectionIterations = 50;
+  visualAlignment.configure(config);
+}
+
+void updateMaixCircleSerial() {
+  smartcarrier::MaixCirclePacket packet;
+  while (Serial_MAIX.available() > 0) {
+    if (!maixCircleParser.push(
+            static_cast<uint8_t>(Serial_MAIX.read()), packet)) {
+      continue;
+    }
+
+    const uint32_t nowMs = millis();
+    if (packet.detected) {
+      visualAlignment.submitCircleCenter(
+          static_cast<float>(packet.centerXpx),
+          static_cast<float>(packet.centerYpx),
+          static_cast<float>(packet.radiusPx),
+          static_cast<float>(packet.confidence),
+          packet.frameId,
+          nowMs);
+    } else {
+      visualAlignment.submitNoDetection(packet.frameId, nowMs);
+    }
+
+    if (nowMs - lastMaixDebugMs >= 250) {
+      lastMaixDebugMs = nowMs;
+      Serial_DEBUG.print("Maix circle: ");
+      if (packet.detected) {
+        Serial_DEBUG.print("x=");
+        Serial_DEBUG.print(packet.centerXpx);
+        Serial_DEBUG.print(" y=");
+        Serial_DEBUG.print(packet.centerYpx);
+        Serial_DEBUG.print(" r=");
+        Serial_DEBUG.print(packet.radiusPx);
+        Serial_DEBUG.print(" q=");
+        Serial_DEBUG.println(packet.confidence);
+      } else {
+        Serial_DEBUG.println("not detected");
+      }
+    }
+  }
+}
+
+void requestMaixCircleIfDue() {
+  if (visualAlignment.state() !=
+      smartcarrier::AlignmentState::WAITING_FOR_SAMPLE) {
+    return;
+  }
+
+  const uint32_t nowMs = millis();
+  if (nowMs - maixCircleModeStartedMs < MAIX_MODE_WARMUP_MS ||
+      nowMs - lastMaixRequestMs < MAIX_REQUEST_INTERVAL_MS) {
+    return;
+  }
+  lastMaixRequestMs = nowMs;
+  Serial_MAIX.write(
+      smartcarrier::MAIX_CIRCLE_REQUEST,
+      sizeof(smartcarrier::MAIX_CIRCLE_REQUEST));
+}
+
+const char *alignmentFaultName(
+    smartcarrier::AlignmentFault fault) {
+  switch (fault) {
+    case smartcarrier::AlignmentFault::NONE:
+      return "NONE";
+    case smartcarrier::AlignmentFault::INVALID_CONFIGURATION:
+      return "INVALID_CONFIGURATION";
+    case smartcarrier::AlignmentFault::SAMPLE_TIMEOUT:
+      return "SAMPLE_TIMEOUT";
+    case smartcarrier::AlignmentFault::TOO_MANY_LOST_FRAMES:
+      return "TOO_MANY_LOST_FRAMES";
+    case smartcarrier::AlignmentFault::MOTION_REJECTED:
+      return "MOTION_REJECTED";
+    case smartcarrier::AlignmentFault::MOTION_TIMEOUT:
+      return "MOTION_TIMEOUT";
+    case smartcarrier::AlignmentFault::ITERATION_LIMIT:
+      return "ITERATION_LIMIT";
+    case smartcarrier::AlignmentFault::CALIBRATION_COMMAND_ZERO:
+      return "CALIBRATION_COMMAND_ZERO";
+  }
+  return "UNKNOWN";
+}
+
+bool isVisualAlignmentCheckpoint(
+    const RouteSegment &segment) {
+  if (segment.actionAtEnd == StopAction::PROCESS_AND_LOAD_BATCH_1 ||
+      segment.actionAtEnd == StopAction::STORE_BATCH_1 ||
+      segment.actionAtEnd == StopAction::STORE_BATCH_2) {
+    return true;
+  }
+  if (segment.actionAtEnd ==
+      StopAction::PROCESS_AND_LOAD_BATCH_2) {
+    // 路线中另有一个30 mm的同名中间段，只在真正的加工区终点启动视觉。
+    return segment.amount > 100;
+  }
+  return false;
+}
+
+void beginVisualAlignment(StopAction checkpoint) {
+  stopWheelPulses();
+  segmentIsRotation = false;
+  maixCircleParser.reset();
+  while (Serial_MAIX.available() > 0) {
+    Serial_MAIX.read();
+  }
+
+  Serial_MAIX.write(
+      smartcarrier::MAIX_SET_CIRCLE_MODE,
+      sizeof(smartcarrier::MAIX_SET_CIRCLE_MODE));
+  maixCircleModeStartedMs = millis();
+  lastMaixRequestMs = maixCircleModeStartedMs;
+
+  if (!visualAlignment.start(maixCircleModeStartedMs)) {
+    Serial_DEBUG.println(
+        "Visual alignment start rejected: invalid configuration.");
+    emergencyStop();
+    return;
+  }
+
+  programState = ProgramState::VISUAL_ALIGNING;
+  Serial_DEBUG.print("Visual fine alignment started at ");
+  Serial_DEBUG.println(checkpointName(checkpoint));
+}
+
+void updateVisualAlignment() {
+  requestMaixCircleIfDue();
+  visualAlignment.update(millis());
+
+  if (visualAlignment.isAligned()) {
+    setMaixColorMode();
+    Serial_DEBUG.print("Visual alignment complete: error=(");
+    Serial_DEBUG.print(visualAlignment.lastErrorXpx(), 2);
+    Serial_DEBUG.print(", ");
+    Serial_DEBUG.print(visualAlignment.lastErrorYpx(), 2);
+    Serial_DEBUG.print(") px, iterations=");
+    Serial_DEBUG.println(visualAlignment.correctionIterations());
+    checkpointStartTime = millis();
+    programState = ProgramState::CHECKPOINT_DWELL;
+    return;
+  }
+
+  if (visualAlignment.state() ==
+      smartcarrier::AlignmentState::FAULT) {
+    setMaixColorMode();
+    Serial_DEBUG.print("Visual alignment fault: ");
+    Serial_DEBUG.println(
+        alignmentFaultName(visualAlignment.fault()));
+    emergencyStop();
+  }
+}
+
 // 按钮停车不直接切断驱动器，而是沿当前平移方向逐步降低四轮速度。
 // 减速过程中保留有限的航向纠偏；纠偏上限随平移速度下降，避免停车末段原地旋转。
 void updateSafeStopping() {
@@ -712,6 +1111,140 @@ void updateSafeStopping() {
   }
 }
 
+void finishHmiCommand() {
+  Serial_TJCHMI.write(0xFF);
+  Serial_TJCHMI.write(0xFF);
+  Serial_TJCHMI.write(0xFF);
+}
+
+void setHmiText(const char *component, const char *text) {
+  Serial_TJCHMI.print(component);
+  Serial_TJCHMI.print(".txt=\"");
+  for (const char *p = text; *p != '\0'; ++p) {
+    const uint8_t value = static_cast<uint8_t>(*p);
+    // 淘晶驰文本控件通过串口接收CRLF实现换行，原样发送这两个控制字符。
+    if (*p == '\r' || *p == '\n') {
+      Serial_TJCHMI.write(value);
+    } else if (value < 0x20 || value > 0x7E || *p == '"' || *p == '\\') {
+      Serial_TJCHMI.write('?');
+    } else {
+      Serial_TJCHMI.write(value);
+    }
+  }
+  Serial_TJCHMI.write('"');
+  finishHmiCommand();
+}
+
+void showQrWaitingOnScreen() {
+  Serial_TJCHMI.print("page QR");
+  finishHmiCommand();
+  setHmiText("QR.t1", "QRWAIT");
+  setHmiText("QR.t2", "000+000\r\n+000+000");
+}
+
+void resetQrReception(bool updateScreen) {
+  qrPayload[0] = '\0';
+  qrTaskCode[0] = '\0';
+  strcpy(qrTaskCodeDisplay, "000+000\r\n+000+000");
+  qrDataIndex = 0;
+  qrFrameOverflow = false;
+  qrTaskReady = false;
+  while (Serial_QR.available() > 0) {
+    Serial_QR.read();
+  }
+  if (updateScreen) {
+    showQrWaitingOnScreen();
+  }
+}
+
+bool extractTwelveDigitTaskCode(const char *payload) {
+  size_t digitCount = 0;
+  for (const char *p = payload; *p != '\0'; ++p) {
+    if (*p >= '0' && *p <= '9') {
+      if (digitCount >= TASK_CODE_DIGIT_COUNT) {
+        return false;
+      }
+      qrTaskCode[digitCount++] = *p;
+    }
+  }
+  if (digitCount != TASK_CODE_DIGIT_COUNT) {
+    qrTaskCode[0] = '\0';
+    return false;
+  }
+  qrTaskCode[TASK_CODE_DIGIT_COUNT] = '\0';
+
+  size_t outputIndex = 0;
+  for (size_t i = 0; i < TASK_CODE_DIGIT_COUNT; ++i) {
+    if (i > 0 && i % 3 == 0) {
+      if (i == 6) {
+        qrTaskCodeDisplay[outputIndex++] = '\r';
+        qrTaskCodeDisplay[outputIndex++] = '\n';
+      }
+      qrTaskCodeDisplay[outputIndex++] = '+';
+    }
+    qrTaskCodeDisplay[outputIndex++] = qrTaskCode[i];
+  }
+  qrTaskCodeDisplay[outputIndex] = '\0';
+  return true;
+}
+
+void completeQrFrame() {
+  if (qrDataIndex == 0) {
+    return;
+  }
+
+  qrPayload[qrDataIndex] = '\0';
+  const bool validTaskCode =
+      !qrFrameOverflow && extractTwelveDigitTaskCode(qrPayload);
+  qrDataIndex = 0;
+  qrFrameOverflow = false;
+
+  if (!validTaskCode) {
+    setHmiText("QR.t1", "QRERR");
+    setHmiText("QR.t2", "INVALID TASK");
+    Serial_DEBUG.print("QR rejected (need exactly 12 digits): ");
+    Serial_DEBUG.println(qrPayload);
+    return;
+  }
+
+  qrTaskReady = true;
+  setHmiText("QR.t1", "QROK");
+  setHmiText("QR.t2", qrTaskCodeDisplay);
+  Serial_DEBUG.print("QR content: ");
+  Serial_DEBUG.println(qrPayload);
+  Serial_DEBUG.print("12-digit task code: ");
+  Serial_DEBUG.println(qrTaskCode);
+}
+
+// GM75默认以CR结束；也兼容CRLF或仅LF。接收过程不使用delay。
+void updateQrScanner() {
+  while (Serial_QR.available() > 0) {
+    const char incoming = static_cast<char>(Serial_QR.read());
+    if (incoming == '\r' || incoming == '\n') {
+      completeQrFrame();
+      continue;
+    }
+
+    if (qrTaskReady) {
+      continue;
+    }
+    if (qrDataIndex < QR_PAYLOAD_CAPACITY - 1) {
+      qrPayload[qrDataIndex++] = incoming;
+    } else {
+      qrFrameOverflow = true;
+    }
+  }
+}
+
+void beginQrScanCheckpoint() {
+  programState = ProgramState::QR_SCANNING;
+  if (!qrTaskReady) {
+    showQrWaitingOnScreen();
+    Serial_DEBUG.println(
+        "QR board: stopped, waiting for a QR code containing exactly 12 digits.");
+  }
+}
+
 const char *programStateName() {
   switch (programState) {
     case ProgramState::GRIPPER_OPENING:
@@ -726,6 +1259,10 @@ const char *programStateName() {
       return "MOVING";
     case ProgramState::ARM_BASE_MOVING:
       return "ARM_BASE";
+    case ProgramState::VISUAL_ALIGNING:
+      return "VISION_ALIGN";
+    case ProgramState::QR_SCANNING:
+      return "QR_SCAN";
     case ProgramState::CHECKPOINT_DWELL:
       return "DWELL";
     case ProgramState::SAFE_STOPPING:
@@ -912,6 +1449,7 @@ void startRouteFromBeginning() {
   armBaseStopRequested = false;
   setArmBaseEnabled(false);
   routeIndex = 0;
+  resetQrReception(false);
   setDriverEnabled(true);
 
   Serial_DEBUG.print("Start button: route restarted from segment 1, target yaw=");
@@ -979,6 +1517,15 @@ void updateInitialGripperClamp() {
 }
 
 void requestSafeStop() {
+  if (programState == ProgramState::VISUAL_ALIGNING) {
+    visualAlignment.cancel();
+    setMaixColorMode();
+    completeSafeStop();
+    Serial_DEBUG.println(
+        "Start button: visual alignment cancelled and route reset.");
+    return;
+  }
+
   if (programState == ProgramState::ARM_BASE_MOVING) {
     armBaseStopRequested = true;
     if (fabsf(armBaseStepper.speed()) > 0.0F) {
@@ -1000,7 +1547,8 @@ void requestSafeStop() {
   }
 
   // 路径点停顿期间轮速本来就是零，直接完成安全停车。
-  if (programState == ProgramState::CHECKPOINT_DWELL) {
+  if (programState == ProgramState::QR_SCANNING ||
+      programState == ProgramState::CHECKPOINT_DWELL) {
     completeSafeStop();
   }
 }
@@ -1032,6 +1580,11 @@ void handleArrival() {
     Serial_DEBUG.println(checkpointName(segment.actionAtEnd));
   }
 
+  if (isVisualAlignmentCheckpoint(segment)) {
+    beginVisualAlignment(segment.actionAtEnd);
+    return;
+  }
+
   // 第一批首次到达原料区：机械臂底座从软件零点顺时针转到+90°。
   // 第二批到达暂存区后先执行下一段小车转向；该转向段完成时，
   // ARM_BASE_RETURN_HOME再触发底座逆时针90°返回软件零点。
@@ -1044,6 +1597,10 @@ void handleArrival() {
     startArmBaseMove(false);
     return;
   }
+  if (segment.actionAtEnd == StopAction::QR_SCAN) {
+    beginQrScanCheckpoint();
+    return;
+  }
 
   // 每个路径点短暂停车，然后loop()自动启动下一段，不需要人工确认。
   checkpointStartTime = millis();
@@ -1053,6 +1610,8 @@ void handleArrival() {
 // 紧急停止采用直接关闭驱动器的方式，不等待减速完成。
 // 触发后必须复位主控板才能重新开始路线。
 void emergencyStop() {
+  visualAlignment.cancel();
+  setMaixColorMode();
   stopWheelPulses();
   segmentIsRotation = false;
   setArmBaseEnabled(false);
@@ -1063,6 +1622,8 @@ void emergencyStop() {
 }
 
 void imuFaultStop() {
+  visualAlignment.cancel();
+  setMaixColorMode();
   stopWheelPulses();
   segmentIsRotation = false;
   setArmBaseEnabled(false);
@@ -1100,6 +1661,8 @@ void onStartButtonClick() {
 
     case ProgramState::MOVING:
     case ProgramState::ARM_BASE_MOVING:
+    case ProgramState::VISUAL_ALIGNING:
+    case ProgramState::QR_SCANNING:
     case ProgramState::CHECKPOINT_DWELL:
       requestSafeStop();
       break;
@@ -1142,6 +1705,20 @@ void setup() {
   delay(100);
   Serial_DEBUG.println();
   Serial_DEBUG.println("[BOOT 1] PB13 debug TX started at 115200.");
+  Serial_DEBUG.flush();
+
+  Serial_TJCHMI.begin(TJCHMI_UART_BAUD);
+  Serial_QR.begin(QR_UART_BAUD);
+  Serial_MAIX.begin(MAIX_UART_BAUD);
+  delay(200);
+  while (Serial_TJCHMI.read() >= 0) {
+  }
+  resetQrReception(true);
+  Serial_DEBUG.println(
+      "[BOOT QR] Screen PB15/PB14@115200; GM75 PE0/PE1@9600.");
+  setMaixColorMode();
+  Serial_DEBUG.println(
+      "[BOOT VISION] MaixCAM PE7/PE8@115200, default COLOR mode.");
   Serial_DEBUG.flush();
 
   // 在任何可能等待通信设备的初始化之前，先可靠关闭底盘和机械臂底座驱动器。
@@ -1188,6 +1765,24 @@ void setup() {
   armBaseStepper.setAcceleration(ARM_BASE_ACCELERATION_PPS2);
   // 软件零点对应机械臂初始朝向。上电前必须人工确认底座位于该位置。
   armBaseStepper.setCurrentPosition(0);
+
+  armStepperProtocol.init(
+      &Serial_ARM_STEPPER, ARM_STEPPER_UART_BAUD);
+  horizontalStepper.init();
+  horizontalStepper.set(
+      HORIZONTAL_SPEED_RPM,
+      HORIZONTAL_ACCELERATION,
+      HORIZONTAL_POSITIVE_DIRECTION,
+      HORIZONTAL_TRAVEL_PER_REV_TENTH_MM,
+      HORIZONTAL_SUBSTEPS);
+  horizontalTargetTenthMm = 0.0F;
+  horizontalStepperReady = horizontalStepper.enable();
+  configureVisualAlignment();
+  Serial_DEBUG.print(
+      "[BOOT ARM] ID6 horizontal axis initialized, ready=");
+  Serial_DEBUG.println(horizontalStepperReady ? "YES" : "NO");
+  Serial_DEBUG.println(
+      "[BOOT ARM] WARNING: ID6 software zero assumes fully retracted.");
 
   // PB9使用内部上拉：松开为HIGH，按钮按下接GND后为LOW。
   startButton.setup(START_BUTTON_PIN, INPUT_PULLUP, true);
@@ -1256,6 +1851,8 @@ void setup() {
 void loop() {
   // HWT101必须在所有程序状态中持续读取，避免UART接收缓存溢出。
   updateImu();
+  updateQrScanner();
+  updateMaixCircleSerial();
 
   // OneButton依靠高频tick()完成消抖和单击识别，不能用长delay阻塞。
   startButton.tick();
@@ -1267,6 +1864,17 @@ void loop() {
   // 同步反馈到电脑串口；即使下面的状态分支提前return，也不会停止上报。
   reportImuToComputer();
 
+  // 二维码点保持停车，收到且解析出恰好12位数字后才进入下一段。
+  if (programState == ProgramState::QR_SCANNING) {
+    if (qrTaskReady) {
+      Serial_DEBUG.println("QR accepted. Route will continue.");
+      checkpointStartTime = millis();
+      programState = ProgramState::CHECKPOINT_DWELL;
+    }
+    delay(1);
+    return;
+  }
+
   // 张开和夹紧均采用非阻塞计时，期间按钮、HWT101和串口仍持续工作。
   if (programState == ProgramState::GRIPPER_OPENING) {
     updateGripperOpening();
@@ -1276,6 +1884,12 @@ void loop() {
 
   if (programState == ProgramState::GRIPPER_CLOSING) {
     updateInitialGripperClamp();
+    delay(1);
+    return;
+  }
+
+  if (programState == ProgramState::VISUAL_ALIGNING) {
+    updateVisualAlignment();
     delay(1);
     return;
   }
