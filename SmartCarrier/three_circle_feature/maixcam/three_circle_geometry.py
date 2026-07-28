@@ -1,11 +1,13 @@
 """Pure geometry model for the numbered three-circle board.
 
 This module intentionally has no Maix imports so the inference rules can be
-tested on a desktop. Board coordinates come from the supplied drawing:
-number 1 = 0 mm, number 2 = 300 mm, number 3 = 580 mm.
+tested on a desktop. Board coordinates come from the supplied drawing: number
+2 is on the centreline, while numbers 1 and 3 are symmetric and 300 mm apart.
 """
 
-BOARD_POSITION_MM = {1: 0.0, 2: 300.0, 3: 580.0}
+BOARD_POSITION_MM = {1: -150.0, 2: 0.0, 3: 150.0}
+MAX_MATERIAL_DIAMETER_MM = 50.0
+OUTERMOST_RING_DIAMETER_MM = 95.0
 
 SOURCE_MISSING = 0
 SOURCE_MEASURED = 1
@@ -133,7 +135,7 @@ def solve_three_targets(observations):
     anchors = model["anchors"]
     used = {id(anchors[0]), id(anchors[1])}
     axis_length = (model["axis_x"] ** 2 + model["axis_y"] ** 2) ** 0.5
-    adjacent_pixels = axis_length * 290.0
+    adjacent_pixels = axis_length * 150.0
     agreement_gate = max(8.0, adjacent_pixels * 0.10)
     targets = []
 

@@ -32,19 +32,19 @@ def test_adjacent_pair_infers_third():
     assert solution["valid"]
     third = target(solution, 3)
     assert third["source"] == SOURCE_INFERRED
-    assert abs(third["x"] - 310) < 0.01
+    assert abs(third["x"] - 320) < 0.01
     assert abs(third["y"] - 100) < 0.01
 
 
-def test_outer_pair_infers_middle_using_300_of_580_ratio():
+def test_outer_pair_infers_symmetric_middle():
     solution = solve_three_targets([
         observation(1, 10, 30),
         observation(3, 300, 88),
     ])
     middle = target(solution, 2)
     assert middle["source"] == SOURCE_INFERRED
-    assert abs(middle["x"] - 160) < 0.01
-    assert abs(middle["y"] - 60) < 0.01
+    assert abs(middle["x"] - 155) < 0.01
+    assert abs(middle["y"] - 59) < 0.01
 
 
 def test_weak_fragment_loses_to_geometric_prediction():
@@ -56,7 +56,7 @@ def test_weak_fragment_loses_to_geometric_prediction():
     ])
     third = target(solution, 3)
     assert third["source"] == SOURCE_INFERRED
-    assert abs(third["x"] - 310) < 0.01
+    assert abs(third["x"] - 320) < 0.01
 
 
 def test_reliable_fragment_is_fused_when_consistent():
@@ -67,7 +67,7 @@ def test_reliable_fragment_is_fused_when_consistent():
     ])
     third = target(solution, 3)
     assert third["source"] == SOURCE_FUSED
-    assert 310 < third["x"] < 313
+    assert 313 < third["x"] < 320
 
 
 if __name__ == "__main__":
