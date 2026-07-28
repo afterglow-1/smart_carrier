@@ -14,11 +14,13 @@
 
 ## 编译和烧录
 
-在 `SmartCarrier/three_circle_feature` 目录执行：
+测试程序本身是一个独立的标准 PlatformIO 工程。可以在 VS Code/PlatformIO 中单独打开 `SmartCarrier/three_circle_feature/arm_calibration_test` 文件夹，然后使用底部状态栏的 Build 和 Upload 按钮。
+
+也可以在 `SmartCarrier/three_circle_feature/arm_calibration_test` 目录执行：
 
 ```powershell
-platformio run -c platformio-arm-calibration.ini -e genericSTM32H750VB
-platformio run -c platformio-arm-calibration.ini -e genericSTM32H750VB -t upload
+platformio run -e genericSTM32H750VB
+platformio run -e genericSTM32H750VB -t upload
 platformio device monitor -b 115200 -p COM10
 ```
 
